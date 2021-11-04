@@ -1,6 +1,6 @@
 #include "../compat.h"
 
-#if !defined(__linux__) && !defined(__BSD__) && defined(ENABLE_OPENGL)
+//#if !defined(__linux__) && !defined(__BSD__) && defined(ENABLE_OPENGL)
 
 #ifdef __MINGW32__
 #define FOR_WINDOWS 1
@@ -312,4 +312,4 @@ struct GfxWindowManagerAPI gfx_sdl = {
     gfx_sdl_get_time
 };
 
-#endif
+//#endif

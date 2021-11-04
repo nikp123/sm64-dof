@@ -167,7 +167,8 @@ void main_func(void) {
 #elif defined(ENABLE_OPENGL)
     rendering_api = &gfx_opengl_api;
     #if defined(__linux__) || defined(__BSD__)
-        wm_api = &gfx_glx;
+        //wm_api = &gfx_glx;
+        wm_api = &gfx_sdl;
     #else
         wm_api = &gfx_sdl;
     #endif
