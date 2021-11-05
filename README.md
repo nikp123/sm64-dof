@@ -1,4 +1,4 @@
-# Super Mario 64 Port
+# Super Mario 64 Port (with DOF support)
 
 - This repo contains a full decompilation of Super Mario 64 (J), (U), and (E) with minor exceptions in the audio subsystem.
 - Naming and documentation of the source code and data structures are in progress.
@@ -87,3 +87,7 @@ discuss what you would like to change.
 Run `clang-format` on your code to ensure it meets the project's coding standards.
 
 Official Discord: https://discord.gg/7bcNTPK
+
+## Shader notes
+Be sure to use the included fragment.glsl file and keep it in your current directory when running
+the sm64 build.
