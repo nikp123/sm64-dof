@@ -1,5 +1,6 @@
 #ifdef ENABLE_OPENGL
 
+#include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -49,6 +50,31 @@ static GLuint opengl_vbo;
 static uint32_t frame_count;
 static uint32_t current_height;
 
+struct System {
+    struct Display {
+        int32_t width;
+        int32_t height;
+    } display;
+    struct FBO {
+        struct shader {
+            GLuint program;
+            GLuint vertex;
+            GLuint fragment;
+            struct uniforms {
+                GLuint POST_POS     ;
+                GLuint POST_TEXCOORD;
+                GLuint POST_TEXTURE ;
+                GLuint POST_DEPTH   ;
+            } uniform;
+        } shader;
+        GLuint framebuffer;
+        GLuint color_texture;
+        GLuint depth_texture;
+    } post;
+    GLuint main_program;
+    struct ShaderProgram *curShader;
+} sys;
+
 static bool gfx_opengl_z_is_from_0_to_1(void) {
     return false;
 }
@@ -71,6 +97,14 @@ static void gfx_opengl_set_uniforms(struct ShaderProgram *prg) {
     }
 }
 
+static void gfx_opengl_load_shader_arrays(struct ShaderProgram *new_prg) {
+    if (new_prg != NULL) {
+        for (int i = 0; i < new_prg->num_attribs; i++) {
+            glDisableVertexAttribArray(new_prg->attrib_locations[i]);
+        }
+    }
+}
+
 static void gfx_opengl_unload_shader(struct ShaderProgram *old_prg) {
     if (old_prg != NULL) {
         for (int i = 0; i < old_prg->num_attribs; i++) {
@@ -80,9 +114,11 @@ static void gfx_opengl_unload_shader(struct ShaderProgram *old_prg) {
 }
 
 static void gfx_opengl_load_shader(struct ShaderProgram *new_prg) {
+    sys.main_program = new_prg->opengl_program_id;
     glUseProgram(new_prg->opengl_program_id);
     gfx_opengl_vertex_array_set_attribs(new_prg);
     gfx_opengl_set_uniforms(new_prg);
+    sys.curShader = new_prg;
 }
 
 static void append_str(char *buf, size_t *len, const char *str) {
@@ -471,10 +507,160 @@ static void gfx_opengl_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
 }
 
+static void throw_shader_error(GLenum shader_type, GLuint handle,
+        char* shader_text) {
+    GLint status;
+    glGetShaderiv(handle, GL_COMPILE_STATUS, &status);
+    if (!status) {
+        char log[1000] = {0};
+        GLsizei len;
+        glGetShaderInfoLog(handle, 1000, &len, log);
+
+        bool unknown_type = false;
+        int file, line, char_num;
+        size_t matched_elements = sscanf(log, "%d:%d(%d)",
+                &file, &line, &char_num);
+        if(matched_elements < 3) {
+            size_t matched_elements = sscanf(log, "%d(%d)",
+                    &line, &char_num);
+            if(matched_elements < 2)
+                unknown_type = true;
+        }
+
+        if(unknown_type) {
+            printf("Error: Compiling failed\n%*s\n",
+                    len, log);
+        } else {
+            char *source_line;
+            char *string_ptr = shader_text;
+            for(int i=0; i < line-1; i++) {
+                string_ptr = strchr(string_ptr, '\n');
+                string_ptr++;
+            }
+            source_line = strdup(string_ptr);
+            *strchr(source_line, '\n') = '\0';
+
+            printf("Error: Compiling failed\n%.*sCode:\n% 4d: %.*s\n",
+                    len, log, line, 256, source_line);
+
+            free(source_line);
+        }
+    }
+}
+
+static void compile_post_shaders(void) {
+    char *vertex_shader_source =
+        "#version 100\n"
+        "attribute vec4 v_texCoord;\n"
+        "attribute vec2 m_texCoord;\n"
+        "varying vec2 texCoord;\n"
+        "void main() {\n"
+        "   gl_Position = v_texCoord;\n"
+        "   texCoord = m_texCoord;\n"
+        "}\n\0";
+
+    FILE *fragment_shader = fopen("fragment.glsl", "ro");
+    if(!fragment_shader) {
+        fprintf(stderr, "Failed to open fragment shader\n");
+        exit(EXIT_FAILURE);
+    }
+
+    fseek(fragment_shader, 0, SEEK_END);
+    size_t frag_size = ftell(fragment_shader);
+    fseek(fragment_shader, 0, SEEK_SET);
+
+    char *fragment_shader_source = malloc(frag_size+4096);
+    memset(fragment_shader_source, 0x00, frag_size+4096);
+    fread(fragment_shader_source, 1, frag_size-1, fragment_shader);
+    fragment_shader_source[frag_size] = '\0';
+
+    sys.post.shader.vertex = glCreateShader(GL_VERTEX_SHADER);
+    sys.post.shader.fragment = glCreateShader(GL_FRAGMENT_SHADER);
+    
+    glShaderSource(sys.post.shader.vertex, 1, 
+            &vertex_shader_source, NULL);
+    glShaderSource(sys.post.shader.fragment, 1, 
+            &fragment_shader_source, NULL);
+    
+    glCompileShader(sys.post.shader.vertex);
+    glCompileShader(sys.post.shader.fragment);
+    
+    throw_shader_error(GL_VERTEX_SHADER, sys.post.shader.vertex,
+            vertex_shader_source);
+    throw_shader_error(GL_FRAGMENT_SHADER, sys.post.shader.fragment,
+            fragment_shader_source);
+    
+    sys.post.shader.program = glCreateProgram();
+    glAttachShader(sys.post.shader.program, sys.post.shader.vertex);
+    glAttachShader(sys.post.shader.program, sys.post.shader.fragment);
+
+    glLinkProgram(sys.post.shader.program);
+
+    glDeleteShader(sys.post.shader.vertex);
+    glDeleteShader(sys.post.shader.fragment);
+    fclose(fragment_shader);
+}
+
+static void create_post_textures(void) {
+    GLint old_program;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
+
+    // switch to appropriate shader
+    glUseProgram(sys.post.shader.program);
+
+    // set texture properties
+    glGenTextures(1,               &sys.post.color_texture);
+    glBindTexture(GL_TEXTURE_2D,   sys.post.color_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 
+            sys.display.width,
+            sys.display.height,
+            0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+    // set texture properties
+    glGenTextures(1,             &sys.post.depth_texture);
+    glBindTexture(GL_TEXTURE_2D,  sys.post.depth_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT,
+            sys.display.width,
+            sys.display.height,
+            0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    
+    // set framebuffer properties
+    glGenFramebuffers(1,             &sys.post.framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, sys.post.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_TEXTURE_2D, sys.post.color_texture, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+        GL_TEXTURE_2D, sys.post.depth_texture, 0);
+    
+    // check if it borked
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if(status != GL_FRAMEBUFFER_COMPLETE) {
+        printf("Failed to create framebuffer(s)! Error code 0x%X\n",
+                status);
+    }   
+    sys.post.shader.uniform.POST_POS        = glGetAttribLocation(sys.post.shader.program,  "v_texCoord");
+    sys.post.shader.uniform.POST_TEXCOORD   = glGetAttribLocation(sys.post.shader.program,  "m_texCoord");
+    sys.post.shader.uniform.POST_TEXTURE    = glGetUniformLocation(sys.post.shader.program, "color_texture");
+    sys.post.shader.uniform.POST_DEPTH      = glGetUniformLocation(sys.post.shader.program, "depth_texture");
+    
+    glUseProgram(old_program);
+}
+
 static void gfx_opengl_init(void) {
 #if FOR_WINDOWS
     glewInit();
 #endif
+    
+    compile_post_shaders();
+    create_post_textures();
     
     glGenBuffers(1, &opengl_vbo);
     
@@ -487,8 +673,67 @@ static void gfx_opengl_init(void) {
 static void gfx_opengl_on_resize(void) {
 }
 
+static void update_texture_size(void) {
+    GLint old_program;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
+    
+    // switch to appropriate shader
+    glUseProgram(sys.post.shader.program);
+    
+    glBindTexture(GL_TEXTURE_2D,   sys.post.color_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 
+            sys.display.width,
+            sys.display.height,
+            0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+
+    glBindTexture(GL_TEXTURE_2D,  sys.post.depth_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT,
+            sys.display.width,
+            sys.display.height,
+            0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, sys.post.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_TEXTURE_2D, sys.post.color_texture, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+        GL_TEXTURE_2D, sys.post.depth_texture, 0);
+
+    glUseProgram(old_program);
+}
+
+static void update_display_size(void) {
+    GLint m_viewport[4];
+    bool resized = false; 
+    glGetIntegerv( GL_VIEWPORT, m_viewport );
+
+    if(m_viewport[2] != sys.display.width ||
+            m_viewport[3] != sys.display.height) {
+        sys.display.width = m_viewport[2];
+        sys.display.height = m_viewport[3];
+        printf("Display resized to: %d %d\n",
+                sys.display.width,
+                sys.display.height);
+        resized = true;
+    }
+
+    if(!resized)
+        return;
+
+    // if it was resized then change the texture size
+    update_texture_size();
+}
+
 static void gfx_opengl_start_frame(void) {
     frame_count++;
+
+    update_display_size();
+
+    glBindFramebuffer(GL_FRAMEBUFFER, sys.post.framebuffer);
+
+    glUseProgram(sys.main_program);
+    gfx_opengl_load_shader_arrays(sys.curShader);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, opengl_vbo);
 
     glDisable(GL_SCISSOR_TEST);
     glDepthMask(GL_TRUE); // Must be set to clear Z-buffer
@@ -497,7 +742,77 @@ static void gfx_opengl_start_frame(void) {
     glEnable(GL_SCISSOR_TEST);
 }
 
+//struct System {
+//    struct Display {
+//        uint32_t width;
+//        uint32_t height;
+//    } display;
+//    struct FBO {
+//        struct shader {
+//            GLuint program;
+//            GLuint vertex;
+//            GLuint fragment;
+//            struct uniforms {
+//                GLuint POST_POS     ;
+//                GLuint POST_TEXCOORD;
+//                GLuint POST_TEXTURE ;
+//                GLuint POST_DEPTH   ;
+//            } uniform;
+//        } shader;
+//        GLuint framebuffer;
+//        GLuint color_texture;
+//        GLuint depth_texture;
+//    } post;
+//    GLuint main_program;
+//} sys;
+
 static void gfx_opengl_end_frame(void) {
+    gfx_opengl_unload_shader(sys.curShader);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    glUseProgram(sys.post.shader.program);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    
+    GLfloat postVertices[] = {
+        -1.0f, -1.0f,  // Position 0
+         0.0f,  0.0f,  // TexCoord 0
+         1.0f, -1.0f,  // Position 1
+         1.0f,  0.0f,  // TexCoord 1
+         1.0f,  1.0f,  // Position 2
+         1.0f,  1.0f,  // TexCoord 2
+        -1.0f,  1.0f,  // Position 3
+         0.0f,  1.0f}; // TexCoord 3
+
+    glVertexAttribPointer(sys.post.shader.uniform.POST_POS,
+        2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), postVertices);
+    glVertexAttribPointer(sys.post.shader.uniform.POST_TEXCOORD,
+        2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), &postVertices[2]);
+    
+    // enable the use of the following attribute elements
+    glEnableVertexAttribArray(sys.post.shader.uniform.POST_POS);
+    glEnableVertexAttribArray(sys.post.shader.uniform.POST_TEXCOORD);
+    
+    // Bind the textures
+    // Render texture
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sys.post.color_texture);
+    glUniform1i(sys.post.shader.uniform.POST_TEXTURE, 0);
+    
+    // Depth texture
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, sys.post.depth_texture);
+    glUniform1i(sys.post.shader.uniform.POST_DEPTH, 1);
+    
+    // draw frame
+    GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
+    
+    glDisableVertexAttribArray(sys.post.shader.uniform.POST_POS);
+    glDisableVertexAttribArray(sys.post.shader.uniform.POST_TEXCOORD);
 }
 
 static void gfx_opengl_finish_render(void) {
